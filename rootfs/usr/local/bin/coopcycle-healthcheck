@@ -1,0 +1,4 @@
+#!/bin/sh
+# Healthy once Symfony itself answers, not just nginx: the login page renders
+# through the full stack (php-fpm, database, Redis-backed cache and session).
+exec wget -q -T 10 -O /dev/null http://127.0.0.1/login

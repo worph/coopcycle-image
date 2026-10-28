@@ -1,0 +1,154 @@
+#!/bin/sh
+# Roles:
+#   web     (default) prepare the database and storage, then serve HTTP on :80
+#   worker  consume the async message queue and the scheduler
+#   <cmd>   anything else is exec'd as is (e.g. `bin/console ...`)
+#
+# Everything the app keeps lives under $COOPCYCLE_DATA_DIR (default /data):
+#   jwt/     the RSA keypair API tokens are signed with
+#   images/  generated avatars and other files the app writes under web/images
+#   media/   the liip/imagine thumbnail cache (regenerable)
+#   logs/    Symfony's rotating logs
+set -e
+
+cd /var/www/html
+
+role="${1:-web}"
+DATA="${COOPCYCLE_DATA_DIR:-/data}"
+# Console commands only: the cache warm-up compiles every Twig template and
+# the whole container in one process, well past the 256M a web request gets.
+console="su-exec www-data php -d memory_limit=1G bin/console --no-interaction"
+boot="php /usr/local/lib/coopcycle/bootstrap.php"
+
+export COOPCYCLE_PRIVATE_KEY_FILE="${COOPCYCLE_PRIVATE_KEY_FILE:-$DATA/jwt/private.pem}"
+export COOPCYCLE_PUBLIC_KEY_FILE="${COOPCYCLE_PUBLIC_KEY_FILE:-$DATA/jwt/public.pem}"
+export APP_LOG_DIR="${APP_LOG_DIR:-$DATA/logs}"
+export PHP_FPM_MAX_CHILDREN="${PHP_FPM_MAX_CHILDREN:-8}"
+
+log() { printf '[coopcycle] %s\n' "$*"; }
+
+link_data() {
+  mkdir -p "$DATA/jwt" "$DATA/images" "$DATA/media" "$DATA/logs"
+  for d in images media; do
+    if [ ! -L "web/$d" ]; then
+      rm -rf "web/$d"
+      ln -s "$DATA/$d" "web/$d"
+    fi
+  done
+  chown www-data:www-data "$DATA" "$DATA/images" "$DATA/media" "$DATA/logs"
+  # var/ holds the Symfony cache, rebuilt on every start.
+  mkdir -p var/cache var/sessions
+  chown -R www-data:www-data var
+}
+
+ensure_jwt() {
+  if [ -z "$COOPCYCLE_PRIVATE_KEY_PASSPHRASE" ]; then
+    log "COOPCYCLE_PRIVATE_KEY_PASSPHRASE is not set"; exit 1
+  fi
+  if [ ! -f "$COOPCYCLE_PRIVATE_KEY_FILE" ]; then
+    log "generating the API token signing key"
+    openssl genrsa -aes256 -passout env:COOPCYCLE_PRIVATE_KEY_PASSPHRASE \
+      -out "$COOPCYCLE_PRIVATE_KEY_FILE" 4096
+  fi
+  if [ ! -f "$COOPCYCLE_PUBLIC_KEY_FILE" ]; then
+    openssl rsa -pubout -passin env:COOPCYCLE_PRIVATE_KEY_PASSPHRASE \
+      -in "$COOPCYCLE_PRIVATE_KEY_FILE" -out "$COOPCYCLE_PUBLIC_KEY_FILE"
+  fi
+  chown www-data:www-data "$COOPCYCLE_PRIVATE_KEY_FILE" "$COOPCYCLE_PUBLIC_KEY_FILE"
+  chmod 0640 "$COOPCYCLE_PRIVATE_KEY_FILE"
+  chmod 0644 "$COOPCYCLE_PUBLIC_KEY_FILE"
+}
+
+prepare_database() {
+  $boot wait-db 600
+
+  $console doctrine:query:sql 'CREATE EXTENSION IF NOT EXISTS postgis'
+  $console doctrine:query:sql 'CREATE EXTENSION IF NOT EXISTS postgis_topology'
+  $console doctrine:query:sql 'CREATE EXTENSION IF NOT EXISTS pg_trgm'
+
+  if $boot has-schema; then
+    log "applying database migrations"
+    $console doctrine:migrations:migrate --allow-no-migration
+  else
+    # A fresh database: create the current schema in one go and mark every
+    # migration as applied, as upstream's `make install-db` does.
+    log "creating the database schema"
+    $console doctrine:schema:create
+    $console doctrine:migrations:sync-metadata-storage
+    $console doctrine:migrations:version --add --all
+  fi
+}
+
+ensure_admin() {
+  [ -n "$COOPCYCLE_ADMIN_USERNAME" ] || return 0
+  if $boot has-user "$COOPCYCLE_ADMIN_USERNAME"; then
+    return 0
+  fi
+  if [ -z "$COOPCYCLE_ADMIN_PASSWORD" ]; then
+    log "COOPCYCLE_ADMIN_PASSWORD is empty; not creating the admin account"
+    return 0
+  fi
+  log "creating the admin account $COOPCYCLE_ADMIN_USERNAME"
+  $console nucleos:user:create "$COOPCYCLE_ADMIN_USERNAME" \
+    "${COOPCYCLE_ADMIN_EMAIL:-admin@localhost}" "$COOPCYCLE_ADMIN_PASSWORD"
+  $console nucleos:user:promote "$COOPCYCLE_ADMIN_USERNAME" ROLE_ADMIN
+}
+
+# The settings the app marks mandatory (brand name, administrator e-mail,
+# map centre, currency): without them every admin page carries a warning and
+# the dispatch board fails to load at all. Created only when absent, so
+# whatever the admin saves in Admin > Settings later is kept.
+seed_settings() {
+  $console craue:setting:create --name latlng \
+    --value "${COOPCYCLE_MAP_CENTER:-48.856613,2.352222}"
+  $console craue:setting:create --name brand_name \
+    --value "${COOPCYCLE_BRAND_NAME:-CoopCycle}"
+  $console craue:setting:create --name currency_code \
+    --value "${COOPCYCLE_CURRENCY:-EUR}"
+  if [ -n "$COOPCYCLE_ADMIN_EMAIL" ]; then
+    $console craue:setting:create --name administrator_email \
+      --value "$COOPCYCLE_ADMIN_EMAIL"
+  fi
+}
+
+warm_cache() {
+  rm -rf var/cache/prod
+  $console cache:warmup
+  $console assets:install web --relative
+  chown -R www-data:www-data var
+}
+
+case "$role" in
+  web)
+    link_data
+    ensure_jwt
+    prepare_database
+    $boot s3-buckets 600
+    warm_cache
+    # Idempotent: locales, channels, payment methods, taxes, search
+    # collections. Upstream runs it after every deploy.
+    $console coopcycle:setup
+    seed_settings
+    ensure_admin
+    log "ready"
+    exec /usr/bin/supervisord -c /etc/supervisord.conf
+    ;;
+  worker)
+    link_data
+    $boot wait-db 600
+    # The web container owns the schema and the cache; wait for it to finish
+    # rather than racing it through a migration.
+    until $boot has-schema; do log "waiting for the schema"; sleep 5; done
+    rm -rf var/cache/prod
+    $console cache:warmup >/dev/null 2>&1 || true
+    # messenger:consume exits on its own limits so memory never creeps; loop
+    # here instead of leaning on Docker's restart backoff.
+    while true; do
+      $console messenger:consume async scheduler_default \
+        --limit=100 --time-limit=900 --memory-limit=200M || sleep 5
+    done
+    ;;
+  *)
+    exec "$@"
+    ;;
+esac
