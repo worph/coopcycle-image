@@ -5,7 +5,7 @@ Production image for the AppStoreLab `CoopCycle` app. Upstream
 release tag into one image: `vendor/` without dev dependencies, the webpack
 assets compiled for production, nginx + php-fpm under supervisord.
 
-Published to `ghcr.io/yundera/coopcycle-web` by
+Published to `ghcr.io/worph/coopcycle-image` by
 `.github/workflows/docker-publish.yml`: a `vX.Y.Z` tag publishes `X.Y.Z`,
 `X.Y` and `X`, and every push to `main` publishes `main`. The image version is
 this repo's own; the CoopCycle release it builds is `COOPCYCLE_VERSION` in the
